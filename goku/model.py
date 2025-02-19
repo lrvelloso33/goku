@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from diffusers.models.embeddings import Timesteps, TimestepEmbedding
+
 
 def apply_rotary_emb(
     x: torch.Tensor,
@@ -18,6 +20,21 @@ def apply_rotary_emb(
     out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
 
     return out
+
+
+class PatchEmbed(nn.Module):
+    def __init__(self, patch_size, in_channels, embed_dim, bias=True):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, embed_dim, patch_size, patch_size, bias=bias)
+
+    def forward(self, x):
+        b, c, t, h, w = x.shape
+        x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        latent = self.proj(x)  # [b * t, c, h', w']
+        latent = latent.reshape(b, t, latent.shape[1], latent.shape[2], latent.shape[3])
+        latent = latent.permute(0, 2, 1, 3, 4)  # [b, c, t, h', w']
+        latent = latent.flatten(2).transpose(1, 2)
+        return latent
 
 
 class AdaLayerNorm(nn.Module):
@@ -191,7 +208,6 @@ class Block(nn.Module):
     def forward(
         self,
         hidden_states,
-        attention_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         timestep=None,
@@ -199,7 +215,7 @@ class Block(nn.Module):
     ):
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, timestep)
 
-        attn_output = self.attn1(norm_hidden_states, None, attention_mask, False, rope_pos_embed)
+        attn_output = self.attn1(norm_hidden_states, None, None, False, rope_pos_embed)
 
         attn_output = (gate_msa * attn_output.float()).to(attn_output.dtype)
         hidden_states = attn_output + hidden_states
@@ -216,3 +232,55 @@ class Block(nn.Module):
         hidden_states = ff_output + hidden_states
 
         return hidden_states
+
+
+class GokuModel(nn.Module):
+    def __init__(self, in_channels, out_channels, num_attention_heads, attention_head_dim,
+        depth, patch_size=2, dropout=0.0, cross_attention_dim=None, attention_bias=True
+    ):
+        super().__init__()
+
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        embed_dim = num_attention_heads * attention_head_dim
+        self.patch_embed = PatchEmbed(patch_size=patch_size, in_channels=in_channels, embed_dim=embed_dim)
+
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=1)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embed_dim)
+
+        self.blocks = nn.ModuleList([
+            Block(embed_dim, num_attention_heads, attention_head_dim, dropout, cross_attention_dim, attention_bias) for _ in range(depth)
+        ])
+
+        self.norm_out = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        self.proj_out1 = nn.Linear(embed_dim, embed_dim * 2)
+        self.proj_out2 = nn.Linear(embed_dim, out_channels * patch_size * patch_size)
+
+    def forward(self, hidden_states, encoder_hidden_states, timestep, rope_pos_embed, encoder_attention_mask):
+        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
+            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+
+        num_latent_frames = hidden_states.shape[-3]
+        height, width = hidden_states.shape[-2] // self.patch_size, hidden_states.shape[-1] // self.patch_size
+        hidden_states = self.patch_embed(hidden_states)
+
+        timesteps_proj = self.time_proj(timestep)
+        timestep = self.timestep_embedder(timesteps_proj.to(dtype=hidden_states.dtype))
+
+        for block in self.blocks:
+            hidden_states = block(hidden_states, encoder_hidden_states, encoder_attention_mask, timestep, rope_pos_embed)
+
+        # fp32 for stability
+        shift, scale = self.proj_out1(F.silu(timestep)).unsqueeze(1).float().chunk(2, dim=-1)
+        hidden_states = (self.norm_out(hidden_states).float() * (1 + scale) + shift).to(hidden_states.dtype)
+        hidden_states = self.proj_out2(hidden_states)
+
+        hidden_states = hidden_states.reshape(-1, num_latent_frames, height, width, self.patch_size, self.patch_size, self.out_channels)
+        # [b, t, h, w, p, p, c] -> [b, c, t, h, p, w, p]
+        hidden_states = hidden_states.permute(0, 6, 1, 2, 4, 3, 5)
+        output = hidden_states.reshape(-1, self.out_channels, num_latent_frames, height * self.patch_size, width * self.patch_size)
+
+        return output
